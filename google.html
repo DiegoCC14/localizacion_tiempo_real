@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Obtener Ubicación Precisa</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding: 20px; }
+        #status { color: #666; margin-top: 10px; }
+        #result { font-weight: bold; margin-top: 20px; color: #2c3e50; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #4285f4; color: white; border: none; border-radius: 5px; }
+    </style>
+</head>
+<body>
+
+    <h2>Localizador GPS de Alta Precisión</h2>
+    <button onclick="obtenerUbicacion()">Compartir mi ubicación</button>
+    
+    <p id="status"></p>
+    <div id="result"></div>
+
+    <script>
+        const status = document.getElementById('status');
+        const result = document.getElementById('result');
+
+        function obtenerUbicacion() {
+            if (!navigator.geolocation) {
+                status.textContent = "Tu navegador no soporta geolocalización.";
+                return;
+            }
+
+            status.textContent = "Solicitando permiso y buscando satélites...";
+
+            // Configuración para máxima precisión
+            const options = {
+                enableHighAccuracy: true, // Fuerza el uso de GPS si está disponible
+                timeout: 10000,          // Espera máxima de 10 segundos
+                maximumAge: 0            // No usa ubicaciones cacheadas
+            };
+
+            navigator.geolocation.getCurrentPosition(success, error, options);
+        }
+
+        function success(position) {
+            const lat = position.coords.latitude;
+            const lng = position.coords.longitude;
+            const accuracy = position.coords.accuracy; // Precisión en metros
+
+            status.textContent = "¡Ubicación encontrada!";
+            result.innerHTML = `
+                Latitud: ${lat} <br>
+                Longitud: ${lng} <br>
+                Margen de error: ${accuracy.toFixed(2)} metros <br><br>
+                <a href="https://www.google.com{lat},${lng}" target="_blank">Ver en Google Maps</a>
+            `;
+        }
+
+        function error(err) {
+            status.textContent = "Error: " + err.message;
+            console.warn(`ERROR(${err.code}): ${err.message}`);
+        }
+    </script>
+</body>
+</html>
