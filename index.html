@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GPS + Wi-Fi (Geolocation) - Alta precisión</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; line-height: 1.35; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+    button { padding: 10px 14px; cursor: pointer; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; max-width: 900px; }
+    .kv { display: grid; grid-template-columns: 220px 1fr; gap: 8px 12px; }
+    .muted { color: #555; font-size: 13px; }
+    .ok { color: #0a7; font-weight: 700; }
+    .bad { color: #c22; font-weight: 700; }
+    #map { width: 100%; height: 420px; border-radius: 10px; border: 1px solid #ddd; }
+    code { background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Ubicación precisa (GPS + Wi-Fi) desde Web</h1>
+  <p class="muted">
+    Esto usa <code>navigator.geolocation</code>. Para máxima precisión: HTTPS + permiso del usuario + <code>enableHighAccuracy</code>.
+    En escritorio puede ser menos preciso que en celular.
+  </p>
+
+  <div class="row">
+    <button id="btnOnce">Obtener ubicación (1 vez)</button>
+    <button id="btnWatch">Iniciar tracking (watch)</button>
+    <button id="btnStop" disabled>Detener tracking</button>
+  </div>
+
+  <div class="card" style="margin-top: 16px;">
+    <h2 style="margin-top: 0;">Estado</h2>
+    <div id="status" class="muted">Listo.</div>
+    <hr />
+    <div class="kv">
+      <div><b>Latitud</b></div><div id="lat">—</div>
+      <div><b>Longitud</b></div><div id="lng">—</div>
+      <div><b>Precisión (metros)</b></div><div id="acc">—</div>
+      <div><b>Altitud</b></div><div id="alt">—</div>
+      <div><b>Velocidad</b></div><div id="speed">—</div>
+      <div><b>Rumbo (heading)</b></div><div id="heading">—</div>
+      <div><b>Timestamp</b></div><div id="ts">—</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top: 16px;">
+    <h2 style="margin-top: 0;">Mapa (OpenStreetMap)</h2>
+    <iframe
+      id="map"
+      title="Mapa"
+      loading="lazy"
+      referrerpolicy="no-referrer-when-downgrade"
+      src="about:blank">
+    </iframe>
+    <p class="muted" style="margin-bottom: 0;">
+      Nota: el mapa se centra cuando llega una ubicación. No requiere API key.
+    </p>
+  </div>
+
+  <script>
+    // Helpers UI
+    const $ = (id) => document.getElementById(id);
+
+    const statusEl = $("status");
+    const latEl = $("lat");
+    const lngEl = $("lng");
+    const accEl = $("acc");
+    const altEl = $("alt");
+    const speedEl = $("speed");
+    const headingEl = $("heading");
+    const tsEl = $("ts");
+
+    const btnOnce = $("btnOnce");
+    const btnWatch = $("btnWatch");
+    const btnStop = $("btnStop");
+
+    let watchId = null;
+
+    // Geolocation options: "enableHighAccuracy" fuerza a intentar GPS (si hay),
+    // timeout y maximumAge controlan frescura.
+    const geoOptions = {
+      enableHighAccuracy: true, // clave para intentar la máxima precisión
+      timeout: 15000,           // 15s para obtener fix
+      maximumAge: 0             // 0 = no usar cache
+    };
+
+    function setStatus(msg, type) {
+      statusEl.className = type === "ok" ? "ok" : type === "bad" ? "bad" : "muted";
+      statusEl.textContent = msg;
+    }
+
+    function updateUI(pos) {
+      const c = pos.coords;
+
+      latEl.textContent = c.latitude?.toFixed(7);
+      lngEl.textContent = c.longitude?.toFixed(7);
+      accEl.textContent = (c.accuracy != null) ? `${Math.round(c.accuracy)} m` : "—";
+      altEl.textContent = (c.altitude != null) ? `${c.altitude.toFixed(1)} m` : "—";
+      speedEl.textContent = (c.speed != null) ? `${c.speed.toFixed(2)} m/s` : "—";
+      headingEl.textContent = (c.heading != null) ? `${c.heading.toFixed(1)}°` : "—";
+      tsEl.textContent = new Date(pos.timestamp).toLocaleString();
+
+      // Centrar mapa con OpenStreetMap (embed)
+      // Zoom recomendado según precisión: cuanto menor la accuracy, más zoom.
+      const acc = c.accuracy || 100;
+      const zoom = acc <= 10 ? 18 : acc <= 25 ? 17 : acc <= 50 ? 16 : acc <= 100 ? 15 : 14;
+
+      const bboxDelta = 0.0025; // caja pequeña para que OSM embed centre visualmente
+      const left = c.longitude - bboxDelta;
+      const right = c.longitude + bboxDelta;
+      const top = c.latitude + bboxDelta;
+      const bottom = c.latitude - bboxDelta;
+
+      const osmEmbed =
+        `https://www.openstreetmap.org/export/embed.html?bbox=${left}%2C${bottom}%2C${right}%2C${top}&layer=mapnik&marker=${c.latitude}%2C${c.longitude}&zoom=${zoom}`;
+
+      $("map").src = osmEmbed;
+    }
+
+    function handleError(err) {
+      // err.code: 1 PERMISSION_DENIED, 2 POSITION_UNAVAILABLE, 3 TIMEOUT
+      const codes = {
+        1: "PERMISSION_DENIED (permiso denegado)",
+        2: "POSITION_UNAVAILABLE (no disponible)",
+        3: "TIMEOUT (tiempo agotado)"
+      };
+      const codeName = codes[err.code] || `Código ${err.code}`;
+      setStatus(`Error: ${codeName}. ${err.message}`, "bad");
+    }
+
+    function ensureSupport() {
+      if (!("geolocation" in navigator)) {
+        setStatus("Tu navegador no soporta Geolocation API.", "bad");
+        btnOnce.disabled = true;
+        btnWatch.disabled = true;
+        return false;
+      }
+      // Geolocation en la mayoría de navegadores requiere HTTPS (o localhost)
+      const isSecure = window.isSecureContext || location.hostname === "localhost";
+      if (!isSecure) {
+        setStatus("Advertencia: Para alta precisión y permisos, sirve esto por HTTPS (o localhost).", "bad");
+      } else {
+        setStatus("Listo. Presiona un botón para solicitar permisos y obtener ubicación.", "ok");
+      }
+      return true;
+    }
+
+    btnOnce.addEventListener("click", () => {
+      if (!ensureSupport()) return;
+
+      setStatus("Solicitando ubicación (1 vez)...", "muted");
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          setStatus("Ubicación recibida.", "ok");
+          updateUI(pos);
+        },
+        handleError,
+        geoOptions
+      );
+    });
+
+    btnWatch.addEventListener("click", () => {
+      if (!ensureSupport()) return;
+
+      if (watchId != null) return;
+
+      setStatus("Iniciando tracking (watchPosition)...", "muted");
+      watchId = navigator.geolocation.watchPosition(
+        (pos) => {
+          setStatus("Tracking activo. Actualizando ubicación...", "ok");
+          updateUI(pos);
+        },
+        handleError,
+        geoOptions
+      );
+
+      btnStop.disabled = false;
+      btnWatch.disabled = true;
+    });
+
+    btnStop.addEventListener("click", () => {
+      if (watchId == null) return;
+
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+
+      setStatus("Tracking detenido.", "muted");
+      btnStop.disabled = true;
+      btnWatch.disabled = false;
+    });
+
+    // Init
+    ensureSupport();
+  </script>
+</body>
+</html>
