@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Geolocalización web: círculo de precisión (accuracy)</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; line-height: 1.35; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    button { padding: 10px 14px; cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .6; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; max-width: 1100px; }
+    .kv { display: grid; grid-template-columns: 220px 1fr; gap: 8px 12px; }
+    .muted { color: #555; font-size: 13px; }
+    .ok { color: #0a7; font-weight: 700; }
+    .warn { color: #b36b00; font-weight: 700; }
+    .bad { color: #c22; font-weight: 700; }
+    #wrap { width: 100%; max-width: 1100px; }
+    #canvas { width: 100%; height: 520px; border: 1px solid #ddd; border-radius: 10px; display: block; background: #fff; }
+    code { background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }
+    .log { margin-top: 10px; padding: 10px; background: #fafafa; border: 1px solid #eee; border-radius: 10px; max-height: 220px; overflow: auto; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f2f2f2; font-size: 12px; }
+    .hint { margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Ubicación: punto estimado + <span class="pill">círculo de precisión (accuracy)</span></h1>
+  <p class="muted">
+    El valor <code>coords.accuracy</code> (metros) representa el radio aproximado donde podría estar el dispositivo.
+    Aquí lo verás como un <b>círculo verde</b> alrededor del punto estimado.
+  </p>
+
+  <div class="row">
+    <button id="btnStart">Iniciar medición (watch)</button>
+    <button id="btnStop" disabled>Detener</button>
+    <button id="btnClear">Limpiar</button>
+  </div>
+
+  <div class="card" style="margin-top: 16px;">
+    <h2 style="margin-top: 0;">Estado y datos</h2>
+    <div id="status" class="muted">Listo.</div>
+    <hr />
+    <div class="kv">
+      <div><b>Latitud</b></div><div id="lat">—</div>
+      <div><b>Longitud</b></div><div id="lng">—</div>
+      <div><b>Precisión (radio)</b></div><div id="acc">—</div>
+      <div><b>Zoom sugerido</b></div><div id="zoom">—</div>
+      <div><b>Timestamp</b></div><div id="ts">—</div>
+      <div><b>Lecturas</b></div><div id="count">0</div>
+    </div>
+    <p class="muted hint">
+      Interpretación: si dice <b>5 m</b>, el dispositivo podría estar en cualquier punto <b>dentro del círculo de 5 metros</b>
+      alrededor de la coordenada estimada (en condiciones reales puede variar, pero es la referencia estándar).
+    </p>
+    <div class="log" id="log"></div>
+  </div>
+
+  <div class="card" style="margin-top: 16px;">
+    <h2 style="margin-top: 0;">Vista (OpenStreetMap + overlay)</h2>
+    <p class="muted">
+      Esta vista dibuja:
+      <b>1)</b> un punto central (ubicación estimada) y
+      <b>2)</b> un círculo verde con el radio de <code>accuracy</code>.
+      <br/>No usa API keys. Requiere HTTPS (o localhost) para permisos.
+    </p>
+
+    <div id="wrap">
+      <canvas id="canvas"></canvas>
+    </div>
+
+    <p class="muted">
+      Nota: esto no es un mapa “vectorial” (tipo Google Maps), sino un render simple basado en tiles de OpenStreetMap,
+      suficiente para visualizar claramente el radio en metros.
+    </p>
+  </div>
+
+  <script>
+    // ===========================
+    // Config
+    // ===========================
+    const CONFIG = {
+      maxTimeMs: 30000,
+      maximumAge: 0,
+      enableHighAccuracy: true,
+      // radio mínimo visual para que se vea el círculo cuando la accuracy es muy pequeña (en píxeles)
+      minCirclePx: 6,
+      // tamaño de tile OSM
+      tileSize: 256,
+      // límite de zoom razonable para web
+      minZoom: 13,
+      maxZoom: 19
+    };
+
+    // ===========================
+    // UI helpers
+    // ===========================
+    const $ = (id) => document.getElementById(id);
+
+    const statusEl = $("status");
+    const logEl = $("log");
+    const latEl = $("lat");
+    const lngEl = $("lng");
+    const accEl = $("acc");
+    const zoomEl = $("zoom");
+    const tsEl = $("ts");
+    const countEl = $("count");
+
+    const btnStart = $("btnStart");
+    const btnStop = $("btnStop");
+    const btnClear = $("btnClear");
+
+    const canvas = $("canvas");
+    const ctx = canvas.getContext("2d");
+
+    function setStatus(msg, type = "muted") {
+      statusEl.className = type; // "ok" | "warn" | "bad" | "muted"
+      statusEl.textContent = msg;
+    }
+
+    function log(msg) {
+      const time = new Date().toLocaleTimeString();
+      const line = document.createElement("div");
+      line.textContent = `[${time}] ${msg}`;
+      logEl.prepend(line);
+    }
+
+    function ensureCanvasSize() {
+      // Ajusta el canvas al tamaño real del contenedor (para evitar blur)
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(rect.width * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    function ensureSupport() {
+      if (!("geolocation" in navigator)) {
+        setStatus("Tu navegador no soporta Geolocation API.", "bad");
+        btnStart.disabled = true;
+        return false;
+      }
+      const isSecure = window.isSecureContext || location.hostname === "localhost";
+      if (!isSecure) {
+        setStatus("Advertencia: sirve esto por HTTPS (o localhost) para permisos y mejor precisión.", "warn");
+      } else {
+        setStatus("Listo. Inicia la medición para ver el círculo de precisión.", "ok");
+      }
+      return true;
+    }
+
+    function clearUI() {
+      latEl.textContent = "—";
+      lngEl.textContent = "—";
+      accEl.textContent = "—";
+      zoomEl.textContent = "—";
+      tsEl.textContent = "—";
+      countEl.textContent = "0";
+      logEl.innerHTML = "";
+      setStatus("Listo.", "muted");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    // ===========================
+    // Map math (Web Mercator)
+    // ===========================
+    function clamp(n, min, max) { return Math.max(min, Math.min(max, n)); }
+
+    function lonLatToWorldPx(lon, lat, zoom) {
+      // Web Mercator projection
+      const scale = CONFIG.tileSize * Math.pow(2, zoom);
+      const x = (lon + 180) / 360 * scale;
+
+      const latRad = lat * Math.PI / 180;
+      const y = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * scale;
+
+      return { x, y };
+    }
+
+    function metersPerPixel(lat, zoom) {
+      // Aproximación estándar
+      const earthCircum = 40075016.686; // metros (ecuador)
+      const latRad = lat * Math.PI / 180;
+      const scale = CONFIG.tileSize * Math.pow(2, zoom);
+      return (earthCircum * Math.cos(latRad)) / scale;
+    }
+
+    function suggestZoom(lat, accuracyMeters, canvasCssWidth) {
+      // Queremos que el círculo de accuracy ocupe un % visible del ancho (ej: ~25%)
+      // circle_px = accuracy / metersPerPixel => metersPerPixel = accuracy / circle_px
+      const targetCirclePx = Math.max(80, canvasCssWidth * 0.22); // heurística
+      // buscamos zoom que aprox cumpla
+      let bestZoom = CONFIG.minZoom;
+      let bestDiff = Infinity;
+
+      for (let z = CONFIG.minZoom; z <= CONFIG.maxZoom; z++) {
+        const mpp = metersPerPixel(lat, z);
+        const circlePx = accuracyMeters / mpp;
+        const diff = Math.abs(circlePx - targetCirclePx);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestZoom = z;
+        }
+      }
+      return bestZoom;
+    }
+
+    // ===========================
+    // Tile fetching + draw
+    // ===========================
+    const tileCache = new Map(); // key -> Image
+
+    function tileUrl(z, x, y) {
+      return `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+    }
+
+    function getTile(z, x, y) {
+      const key = `${z}/${x}/${y}`;
+      if (tileCache.has(key)) return tileCache.get(key);
+
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.src = tileUrl(z, x, y);
+      tileCache.set(key, img);
+      return img;
+    }
+
+    async function drawMapWithAccuracy(lat, lon, accuracyMeters) {
+      ensureCanvasSize();
+
+      const rect = canvas.getBoundingClientRect();
+      const width = rect.width;
+      const height = rect.height;
+
+      // Elegimos zoom para que el círculo sea visible
+      const zoom = suggestZoom(lat, accuracyMeters, width);
+      zoomEl.textContent = String(zoom);
+
+      // Centro en world pixels
+      const center = lonLatToWorldPx(lon, lat, zoom);
+
+      // Top-left corner en world pixels
+      const topLeft = { x: center.x - (width / 2), y: center.y - (height / 2) };
+
+      // Tile range visible
+      const startTileX = Math.floor(topLeft.x / CONFIG.tileSize);
+      const startTileY = Math.floor(topLeft.y / CONFIG.tileSize);
+      const endTileX = Math.floor((topLeft.x + width) / CONFIG.tileSize);
+      const endTileY = Math.floor((topLeft.y + height) / CONFIG.tileSize);
+
+      // Clear
+      ctx.clearRect(0, 0, width, height);
+
+      // Draw tiles
+      const promises = [];
+      for (let tx = startTileX; tx <= endTileX; tx++) {
+        for (let ty = startTileY; ty <= endTileY; ty++) {
+          const img = getTile(zoom, tx, ty);
+          // Espera a que cargue (si ya cargó, resuelve rápido)
+          const p = new Promise((resolve) => {
+            if (img.complete && img.naturalWidth) return resolve();
+            img.onload = () => resolve();
+            img.onerror = () => resolve(); // si falla, no bloquea
+          });
+          promises.push(p);
+        }
+      }
+      await Promise.all(promises);
+
+      for (let tx = startTileX; tx <= endTileX; tx++) {
+        for (let ty = startTileY; ty <= endTileY; ty++) {
+          const img = getTile(zoom, tx, ty);
+
+          const px = tx * CONFIG.tileSize - topLeft.x;
+          const py = ty * CONFIG.tileSize - topLeft.y;
+
+          if (img.complete && img.naturalWidth) {
+            ctx.drawImage(img, Math.round(px), Math.round(py), CONFIG.tileSize, CONFIG.tileSize);
+          } else {
+            // placeholder
+            ctx.fillStyle = "#f3f3f3";
+            ctx.fillRect(Math.round(px), Math.round(py), CONFIG.tileSize, CONFIG.tileSize);
+          }
+        }
+      }
+
+      // Convert accuracy meters to pixels
+      const mpp = metersPerPixel(lat, zoom);
+      const radiusPx = Math.max(CONFIG.minCirclePx, accuracyMeters / mpp);
+
+      // Draw accuracy circle (green)
+      const cx = width / 2;
+      const cy = height / 2;
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(0, 180, 80, 0.18)";
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "rgba(0, 180, 80, 0.75)";
+      ctx.stroke();
+
+      // Center marker
+      ctx.beginPath();
+      ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(0, 0, 0, 0.85)";
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.arc(cx, cy, 2, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
+      ctx.fill();
+
+      ctx.restore();
+
+      // Label
+      ctx.save();
+      ctx.font = "14px Arial";
+      ctx.fillStyle = "rgba(0,0,0,0.85)";
+      const label = `Radio de precisión: ~${Math.round(accuracyMeters)} m (zoom ${zoom})`;
+      ctx.fillText(label, 14, 24);
+      ctx.restore();
+    }
+
+    // ===========================
+    // Geolocation logic
+    // ===========================
+    let watchId = null;
+    let readCount = 0;
+
+    const geoOptions = {
+      enableHighAccuracy: CONFIG.enableHighAccuracy,
+      timeout: CONFIG.maxTimeMs,
+      maximumAge: CONFIG.maximumAge
+    };
+
+    function handleError(err) {
+      const codes = {
+        1: "PERMISSION_DENIED (permiso denegado)",
+        2: "POSITION_UNAVAILABLE (no disponible)",
+        3: "TIMEOUT (tiempo agotado)"
+      };
+      const codeName = codes[err.code] || `Código ${err.code}`;
+      setStatus(`Error: ${codeName}. ${err.message}`, "bad");
+      log(`ERROR: ${codeName}. ${err.message}`);
+      stopWatch();
+    }
+
+    function stopWatch() {
+      if (watchId != null) {
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+      }
+      btnStop.disabled = true;
+      btnStart.disabled = false;
+    }
+
+    async function onPosition(pos) {
+      readCount++;
+      countEl.textContent = String(readCount);
+
+      const c = pos.coords;
+      const acc = c.accuracy;
+
+      latEl.textContent = c.latitude?.toFixed(7);
+      lngEl.textContent = c.longitude?.toFixed(7);
+      accEl.textContent = (acc != null) ? `${Math.round(acc)} m` : "—";
+      tsEl.textContent = new Date(pos.timestamp).toLocaleString();
+
+      setStatus("Ubicación recibida. Dibujando círculo de precisión...", "ok");
+      log(`TICK: lat=${c.latitude.toFixed(6)} lon=${c.longitude.toFixed(6)} acc=${Math.round(acc)}m`);
+
+      // Render
+      if (Number.isFinite(acc) && acc > 0) {
+        await drawMapWithAccuracy(c.latitude, c.longitude, acc);
+      }
+    }
+
+    function startWatch() {
+      if (!ensureSupport()) return;
+      if (watchId != null) return;
+
+      readCount = 0;
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+
+      setStatus("Tracking activo. Esperando lecturas...", "muted");
+      log("START: watchPosition (enableHighAccuracy=true)");
+
+      watchId = navigator.geolocation.watchPosition(
+        (pos) => { onPosition(pos).catch(() => {}); },
+        handleError,
+        geoOptions
+      );
+    }
+
+    // ===========================
+    // Events
+    // ===========================
+    btnStart.addEventListener("click", startWatch);
+
+    btnStop.addEventListener("click", () => {
+      setStatus("Tracking detenido.", "muted");
+      log("STOP: detenido manualmente.");
+      stopWatch();
+    });
+
+    btnClear.addEventListener("click", () => {
+      stopWatch();
+      clearUI();
+    });
+
+    // Resize handling
+    window.addEventListener("resize", () => {
+      // Re-render último estado si existe (simple: no guardamos pos, se re-renderiza en el próximo tick)
+      ensureCanvasSize();
+    });
+
+    // Init
+    ensureSupport();
+    // Set default canvas size (CSS height)
+    canvas.style.height = "520px";
+    ensureCanvasSize();
+  </script>
+</body>
+</html>
