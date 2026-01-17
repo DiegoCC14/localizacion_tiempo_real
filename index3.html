@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Geolocalización web: alta precisión (filtrado + mejor lectura)</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; line-height: 1.35; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    button { padding: 10px 14px; cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .6; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; max-width: 980px; }
+    .kv { display: grid; grid-template-columns: 220px 1fr; gap: 8px 12px; }
+    .muted { color: #555; font-size: 13px; }
+    .ok { color: #0a7; font-weight: 700; }
+    .warn { color: #b36b00; font-weight: 700; }
+    .bad { color: #c22; font-weight: 700; }
+    #map { width: 100%; height: 420px; border-radius: 10px; border: 1px solid #ddd; }
+    code { background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }
+    .log { margin-top: 10px; padding: 10px; background: #fafafa; border: 1px solid #eee; border-radius: 10px; max-height: 260px; overflow: auto; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f2f2f2; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Ubicación web optimizada: <span class="pill">enableHighAccuracy</span> + <span class="pill">watch</span> + <span class="pill">mejor lectura</span> + <span class="pill">filtros</span></h1>
+  <p class="muted">
+    Objetivo realista en web: <b>2–5 m</b> en exteriores (si el GPS toma señal). Aquí el script:
+    <b>espera</b> a mejorar la <code>accuracy</code>, <b>descarta</b> lecturas malas, y <b>elige</b> la mejor.
+  </p>
+
+  <div class="row">
+    <button id="btnStart">Iniciar medición (optimizada)</button>
+    <button id="btnStop" disabled>Detener</button>
+    <button id="btnClear">Limpiar</button>
+  </div>
+
+  <div class="card" style="margin-top: 16px;">
+    <h2 style="margin-top: 0;">Parámetros</h2>
+    <div class="kv">
+      <div><b>Objetivo (accuracy ≤)</b></div>
+      <div><span id="targetAccLabel"></span> metros</div>
+
+      <div><b>Tiempo máximo</b></div>
+      <div><span id="maxTimeLabel"></span> ms</div>
+
+      <div><b>Descartar si accuracy &gt;</b></div>
+      <div><span id="discardAboveLabel"></span> metros</div>
+
+      <div><b>Mínimo de lecturas válidas</b></div>
+      <div><span id="minValidLabel"></span></div>
+
+      <div><b>Estrategia</b></div>
+      <div class="muted">
+        1) Solicita ubicación con alta precisión  2) Usa <code>watchPosition</code>  3) Guarda la mejor lectura
+        4) Se detiene al alcanzar objetivo o al expirar el tiempo.
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top: 16px;">
+    <h2 style="margin-top: 0;">Estado</h2>
+    <div id="status" class="muted">Listo.</div>
+    <hr />
+    <div class="kv">
+      <div><b>Latitud</b></div><div id="lat">—</div>
+      <div><b>Longitud</b></div><div id="lng">—</div>
+      <div><b>Precisión (metros)</b></div><div id="acc">—</div>
+      <div><b>Altitud</b></div><div id="alt">—</div>
+      <div><b>Velocidad</b></div><div id="speed">—</div>
+      <div><b>Rumbo (heading)</b></div><div id="heading">—</div>
+      <div><b>Timestamp</b></div><div id="ts">—</div>
+      <div><b>Lecturas válidas</b></div><div id="validCount">0</div>
+      <div><b>Mejor accuracy</b></div><div id="bestAcc">—</div>
+    </div>
+
+    <div class="log" id="log"></div>
+  </div>
+
+  <div class="card" style="margin-top: 16px;">
+    <h2 style="margin-top: 0;">Mapa (OpenStreetMap)</h2>
+    <iframe
+      id="map"
+      title="Mapa"
+      loading="lazy"
+      referrerpolicy="no-referrer-when-downgrade"
+      src="about:blank">
+    </iframe>
+    <p class="muted" style="margin-bottom: 0;">
+      Se centra automáticamente en la <b>mejor lectura</b>.
+    </p>
+  </div>
+
+  <script>
+    // ===========================
+    // CONFIG (ajusta aquí)
+    // ===========================
+    const CONFIG = {
+      targetAccuracyMeters: 5,     // meta realista para web (2–5m en exteriores). 1m NO es garantizable.
+      discardAboveMeters: 50,      // descarta lecturas "malas" (típicas de Wi-Fi/celda o sin fix de GPS)
+      maxTimeMs: 30000,            // tiempo máximo de espera para mejorar accuracy
+      minValidReadings: 2,         // mínimo de lecturas válidas antes de decidir (reduce lecturas "verdes" falsas)
+      maximumAge: 0,               // no usar cache
+      enableHighAccuracy: true     // intenta GPS si está disponible
+    };
+
+    // ===========================
+    // UI Helpers
+    // ===========================
+    const $ = (id) => document.getElementById(id);
+
+    const statusEl = $("status");
+    const logEl = $("log");
+
+    const latEl = $("lat");
+    const lngEl = $("lng");
+    const accEl = $("acc");
+    const altEl = $("alt");
+    const speedEl = $("speed");
+    const headingEl = $("heading");
+    const tsEl = $("ts");
+    const validCountEl = $("validCount");
+    const bestAccEl = $("bestAcc");
+
+    const btnStart = $("btnStart");
+    const btnStop = $("btnStop");
+    const btnClear = $("btnClear");
+
+    $("targetAccLabel").textContent = CONFIG.targetAccuracyMeters;
+    $("maxTimeLabel").textContent = CONFIG.maxTimeMs;
+    $("discardAboveLabel").textContent = CONFIG.discardAboveMeters;
+    $("minValidLabel").textContent = CONFIG.minValidReadings;
+
+    function setStatus(msg, type = "muted") {
+      statusEl.className = type; // "ok" | "warn" | "bad" | "muted"
+      statusEl.textContent = msg;
+    }
+
+    function log(msg) {
+      const time = new Date().toLocaleTimeString();
+      const line = document.createElement("div");
+      line.textContent = `[${time}] ${msg}`;
+      logEl.prepend(line);
+    }
+
+    function clearUI() {
+      latEl.textContent = "—";
+      lngEl.textContent = "—";
+      accEl.textContent = "—";
+      altEl.textContent = "—";
+      speedEl.textContent = "—";
+      headingEl.textContent = "—";
+      tsEl.textContent = "—";
+      validCountEl.textContent = "0";
+      bestAccEl.textContent = "—";
+      logEl.innerHTML = "";
+      $("map").src = "about:blank";
+      setStatus("Listo.", "muted");
+    }
+
+    // ===========================
+    // Geolocation logic (optimizada)
+    // ===========================
+    let watchId = null;
+    let startTime = null;
+    let bestPos = null;
+    let validCount = 0;
+
+    const geoOptions = {
+      enableHighAccuracy: CONFIG.enableHighAccuracy,
+      timeout: CONFIG.maxTimeMs,
+      maximumAge: CONFIG.maximumAge
+    };
+
+    function ensureSupport() {
+      if (!("geolocation" in navigator)) {
+        setStatus("Tu navegador no soporta Geolocation API.", "bad");
+        btnStart.disabled = true;
+        return false;
+      }
+      const isSecure = window.isSecureContext || location.hostname === "localhost";
+      if (!isSecure) {
+        setStatus("Advertencia: sirve esto por HTTPS (o localhost) para permisos y mejor precisión.", "warn");
+      } else {
+        setStatus("Listo. Inicia la medición para solicitar permisos y obtener la mejor lectura.", "ok");
+      }
+      return true;
+    }
+
+    function updateUI(pos) {
+      const c = pos.coords;
+
+      latEl.textContent = c.latitude?.toFixed(7);
+      lngEl.textContent = c.longitude?.toFixed(7);
+      accEl.textContent = (c.accuracy != null) ? `${Math.round(c.accuracy)} m` : "—";
+      altEl.textContent = (c.altitude != null) ? `${c.altitude.toFixed(1)} m` : "—";
+      speedEl.textContent = (c.speed != null) ? `${c.speed.toFixed(2)} m/s` : "—";
+      headingEl.textContent = (c.heading != null) ? `${c.heading.toFixed(1)}°` : "—";
+      tsEl.textContent = new Date(pos.timestamp).toLocaleString();
+
+      validCountEl.textContent = String(validCount);
+      bestAccEl.textContent = bestPos ? `${Math.round(bestPos.coords.accuracy)} m` : "—";
+
+      centerMap(bestPos || pos);
+    }
+
+    function centerMap(pos) {
+      const c = pos.coords;
+      const acc = c.accuracy || 100;
+      const zoom = acc <= 10 ? 18 : acc <= 25 ? 17 : acc <= 50 ? 16 : acc <= 100 ? 15 : 14;
+
+      const bboxDelta = 0.0025;
+      const left = c.longitude - bboxDelta;
+      const right = c.longitude + bboxDelta;
+      const top = c.latitude + bboxDelta;
+      const bottom = c.latitude - bboxDelta;
+
+      const osmEmbed =
+        `https://www.openstreetmap.org/export/embed.html?bbox=${left}%2C${bottom}%2C${right}%2C${top}&layer=mapnik&marker=${c.latitude}%2C${c.longitude}&zoom=${zoom}`;
+
+      $("map").src = osmEmbed;
+    }
+
+    function handleError(err) {
+      const codes = {
+        1: "PERMISSION_DENIED (permiso denegado)",
+        2: "POSITION_UNAVAILABLE (no disponible)",
+        3: "TIMEOUT (tiempo agotado)"
+      };
+      const codeName = codes[err.code] || `Código ${err.code}`;
+      setStatus(`Error: ${codeName}. ${err.message}`, "bad");
+      log(`ERROR: ${codeName}. ${err.message}`);
+      stopWatch();
+    }
+
+    function isValidReading(pos) {
+      const acc = pos.coords.accuracy;
+      if (acc == null) return false;
+      if (!Number.isFinite(acc)) return false;
+      // descarta lecturas muy malas
+      return acc <= CONFIG.discardAboveMeters;
+    }
+
+    function stopWatch() {
+      if (watchId != null) {
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+      }
+      btnStop.disabled = true;
+      btnStart.disabled = false;
+    }
+
+    function finalize(reason) {
+      stopWatch();
+
+      if (!bestPos) {
+        setStatus("No se obtuvo una lectura válida. Reintenta en exteriores o con GPS habilitado.", "bad");
+        log("FINAL: Sin lectura válida.");
+        return;
+      }
+
+      const bestAcc = bestPos.coords.accuracy;
+      const ok = bestAcc <= CONFIG.targetAccuracyMeters && validCount >= CONFIG.minValidReadings;
+
+      setStatus(
+        ok
+          ? `Finalizado: mejor lectura alcanzó ${Math.round(bestAcc)} m (objetivo ≤ ${CONFIG.targetAccuracyMeters} m).`
+          : `Finalizado: mejor lectura ${Math.round(bestAcc)} m (no alcanzó objetivo ≤ ${CONFIG.targetAccuracyMeters} m).`,
+        ok ? "ok" : "warn"
+      );
+
+      log(`FINAL: ${reason}. Mejor accuracy = ${Math.round(bestAcc)} m. Lecturas válidas = ${validCount}.`);
+      updateUI(bestPos);
+      console.log("BEST_POSITION", bestPos);
+    }
+
+    function startOptimizedWatch() {
+      if (!ensureSupport()) return;
+      if (watchId != null) return;
+
+      // reset run
+      startTime = Date.now();
+      bestPos = null;
+      validCount = 0;
+
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+
+      setStatus("Tracking activo. Buscando mejorar accuracy...", "muted");
+      log(`START: objetivo ≤ ${CONFIG.targetAccuracyMeters}m, descartar > ${CONFIG.discardAboveMeters}m, max ${CONFIG.maxTimeMs}ms.`);
+
+      // Watch position: vamos guardando la mejor lectura válida
+      watchId = navigator.geolocation.watchPosition(
+        (pos) => {
+          const acc = pos.coords.accuracy;
+          const elapsed = Date.now() - startTime;
+
+          // Log básico de cada tick
+          log(`TICK: accuracy=${acc != null ? Math.round(acc) + "m" : "—"} elapsed=${elapsed}ms`);
+
+          // Validar lectura
+          if (!isValidReading(pos)) {
+            setStatus(`Leyendo... (descartada por baja calidad: accuracy=${Math.round(acc || 0)}m)`, "warn");
+            return;
+          }
+
+          validCount++;
+
+          // Guardar "mejor" (menor accuracy)
+          if (!bestPos || acc < bestPos.coords.accuracy) {
+            bestPos = pos;
+            log(`BEST: nueva mejor lectura = ${Math.round(acc)}m`);
+            setStatus(`Mejorando... mejor accuracy=${Math.round(acc)}m`, "ok");
+            updateUI(pos);
+          } else {
+            // Actualizar UI con best y contadores (sin mover mapa si no cambia best)
+            setStatus(`Mejorando... mejor accuracy=${Math.round(bestPos.coords.accuracy)}m`, "ok");
+            updateUI(bestPos);
+          }
+
+          // Condición de salida: alcanza objetivo y tiene mínimo de lecturas válidas
+          if (bestPos.coords.accuracy <= CONFIG.targetAccuracyMeters && validCount >= CONFIG.minValidReadings) {
+            finalize("Objetivo alcanzado");
+            return;
+          }
+
+          // Timebox
+          if (elapsed >= CONFIG.maxTimeMs) {
+            finalize("Tiempo máximo alcanzado");
+            return;
+          }
+        },
+        handleError,
+        geoOptions
+      );
+    }
+
+    // ===========================
+    // Events
+    // ===========================
+    btnStart.addEventListener("click", startOptimizedWatch);
+
+    btnStop.addEventListener("click", () => {
+      finalize("Detenido manualmente");
+    });
+
+    btnClear.addEventListener("click", () => {
+      stopWatch();
+      clearUI();
+    });
+
+    // Init
+    ensureSupport();
+  </script>
+</body>
+</html>
